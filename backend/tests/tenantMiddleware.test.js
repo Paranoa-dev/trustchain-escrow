@@ -114,4 +114,109 @@ describe('tenant middleware', () => {
     expect(res.body).toEqual({ error: 'Tenant not found' });
     expect(next).not.toHaveBeenCalled();
   });
+
+  // ── Failure-injection tests for tenant resolution precedence (#437) ──────
+
+  it('passes a prisma timeout to the error handler', async () => {
+    const timeoutError = new Error('Prisma query timed out');
+    timeoutError.code = 'P2024';
+    prismaMock.tenant.findFirst.mockRejectedValue(timeoutError);
+
+    const req = { headers: { 'x-tenant-slug': 'acme' } };
+    const res = createRes();
+    const next = jest.fn();
+
+    await tenantMiddleware(req, res, next);
+
+    expect(next).toHaveBeenCalledWith(timeoutError);
+  });
+
+  it('rejects malformed tenant data as inactive', async () => {
+    prismaMock.tenant.findFirst.mockResolvedValue({
+      id: null,
+      slug: undefined,
+      name: null,
+      status: null,
+      domains: null,
+    });
+
+    const req = { headers: { 'x-tenant-slug': 'acme' } };
+    const res = createRes();
+    const next = jest.fn();
+
+    await tenantMiddleware(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual({ error: 'Tenant is not active' });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('recovers from a transient prisma failure on a subsequent request', async () => {
+    prismaMock.tenant.findFirst
+      .mockRejectedValueOnce(new Error('Temporary DB hiccup'))
+      .mockResolvedValue({
+        id: 'tenant_1',
+        slug: 'acme',
+        name: 'Acme',
+        status: 'active',
+        domains: ['acme.example.com'],
+        branding: {},
+        configuration: {},
+        metadata: {},
+      });
+
+    const req = { headers: { 'x-tenant-slug': 'acme' } };
+    const res = createRes();
+    const next = jest.fn();
+
+    // A transient failure surfaces via next(err).
+    await tenantMiddleware(req, res, next);
+    expect(next).toHaveBeenCalled();
+
+    // A subsequent identical request succeeds once prisma recovers.
+    const res2 = createRes();
+    const next2 = jest.fn();
+    await tenantMiddleware(req, res2, next2);
+    expect(next2).toHaveBeenCalled();
+    expect(res2.headers['X-Tenant-Slug']).toBe('acme');
+  });
+
+  it('passes a terminal database error to the error handler', async () => {
+    const terminalError = new Error('Database connection refused');
+    terminalError.code = 'P2003';
+    prismaMock.tenant.findFirst.mockRejectedValue(terminalError);
+
+    const req = { headers: { 'x-tenant-slug': 'acme' } };
+    const res = createRes();
+    const next = jest.fn();
+
+    await tenantMiddleware(req, res, next);
+
+    expect(next).toHaveBeenCalledWith(terminalError);
+  });
+
+  it('preserves existing public behavior outside tenant resolution precedence', async () => {
+    const tenant = {
+      id: 'tenant_1',
+      slug: 'acme',
+      name: 'Acme',
+      status: 'active',
+      domains: ['acme.example.com'],
+      branding: {},
+      configuration: {},
+      metadata: {},
+    };
+    prismaMock.tenant.findFirst.mockResolvedValue(tenant);
+
+    const req = { headers: { 'x-tenant-slug': 'acme' } };
+    const res = createRes();
+    const next = jest.fn();
+
+    await tenantMiddleware(req, res, next);
+
+    expect(prismaMock.tenant.findFirst).toHaveBeenCalledTimes(1);
+    expect(req.tenant).toEqual(tenant);
+    expect(next).toHaveBeenCalled();
+    expect(res.headers['X-Tenant-Slug']).toBe('acme');
+  });
 });
